@@ -80,7 +80,7 @@ def _detect_source_segments(data_root: Path, aliases: dict[str, str], source: st
     )
 
 
-def _build_windows(segments: list[dict], *, limit: int, global_gap_minutes: int) -> list[dict]:
+def _build_windows(segments: list[dict], *, limit: int, global_gap_minutes: int, diagnostics: dict | None = None) -> list[dict]:
     buckets: dict = {}
     for segment in segments:
         start = segment["start"].replace(second=0, microsecond=0)
@@ -171,6 +171,10 @@ def _build_windows(segments: list[dict], *, limit: int, global_gap_minutes: int)
             kept.append(candidate)
             if len(kept) >= limit:
                 break
+    if diagnostics is not None:
+        diagnostics.update({"bucket_minutes": len(buckets), "active_minutes": len(active),
+                            "raw_candidates": len(candidates), "selected_windows": len(kept),
+                            "output_limit_reached": len(kept) >= limit})
     return sorted(kept, key=lambda item: item["start"])
 
 
