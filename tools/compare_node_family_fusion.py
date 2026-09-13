@@ -112,7 +112,7 @@ def classify(values, flags):
     return families
 
 
-def node_candidates(node, samples, sigma):
+def node_candidates(node, samples, sigma, classifier=classify):
     times = samples["times"]
     lookup = {t: i for i, t in enumerate(times)}
     series = {(node, "node."+field): [(t, v) for t, v in zip(times, samples["fields"][field]) if math.isfinite(v)] for field in FIELDS}
@@ -130,7 +130,7 @@ def node_candidates(node, samples, sigma):
     for time, state in sorted(flags.items()):
         i = lookup[time]
         values = {field: samples["fields"][field][i] for field in FIELDS}
-        for family, evidence in classify(values, state).items():
+        for family, evidence in classifier(values, state).items():
             grouped[family].append({"time": time, **evidence})
     candidates = []
     skipped = Counter()
