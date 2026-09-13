@@ -249,9 +249,12 @@ def _detect_metric_segments(
     block_start: datetime | None = None,
     block_end: datetime | None = None,
     block_count: int = 292,
+    include_baseline: bool = False,
 ) -> list[dict[str, Any]]:
     if baseline_mode not in {"frozen20", "rolling69", "block292"}:
         raise ValueError(f"Unknown baseline mode: {baseline_mode}")
+    if include_baseline and baseline_mode != "frozen20":
+        raise ValueError("Baseline snapshots require frozen20 mode")
     if baseline_mode == "block292" and (
         block_start is None or block_end is None or block_end <= block_start or block_count <= 0
     ):
@@ -278,6 +281,8 @@ def _detect_metric_segments(
             "points": list(buffer),
             "magnitude": top_point["magnitude"],
         })
+        if include_baseline:
+            segments[-1]["baseline"] = {"mean": frozen_baseline[0], "std": frozen_baseline[1]}
 
     for (node, metric), values in series.items():
         floor = (zero_floors or {}).get(metric, 0.0)
