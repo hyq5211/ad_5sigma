@@ -23,6 +23,9 @@ def main():
     parser.add_argument("--data-root", type=Path, required=True)
     parser.add_argument("--output", type=Path, default=Path("outputs/traffic_baseline_compare"))
     parser.add_argument("--prepare-submissions", action="store_true")
+    parser.add_argument("--modes", nargs="+", choices=("frozen20", "rolling69", "block292"),
+                        default=("frozen20", "rolling69", "block292"))
+    parser.add_argument("--global-gap-minutes", type=int, default=3)
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     repo = Path(__file__).resolve().parents[1]
@@ -36,7 +39,7 @@ def main():
     floors = floors_for(series)
     reference = repo / "outputs/continuous_stage1/C_zero_variance_traffic_windows.jsonl"
     reference_intervals = set(intervals(reference))
-    summary = {"fixed": {"sigma": 5, "metric_gap_minutes": 5, "global_gap_minutes": 3,
+    summary = {"fixed": {"sigma": 5, "metric_gap_minutes": 5, "global_gap_minutes": args.global_gap_minutes,
                           "window_limit": 500, "zero_variance_floors": "same as C",
                           "counter_processing": "same as C; no new gap guard",
                           "variance": "population variance; divide by sample count"},
@@ -45,14 +48,20 @@ def main():
                           "uses_future_samples": True, "forces_one_event_per_block": False},
                "reference": {"AD": 9.535391740361836, "submission_id": "1789285354387"},
                "counter_audit": rate_audit, "variants": {}}
-    for mode in ("frozen20", "rolling69", "block292"):
+    for mode in args.modes:
         print(f"Detecting {mode}", flush=True)
         diagnostics = {}
         segments = fs._detect_metric_segments(series, 5, timedelta(minutes=5), zero_floors=floors,
                         diagnostics=diagnostics, baseline_mode=mode, block_start=start, block_end=end)
-        windows = _build_windows(segments, limit=500, global_gap_minutes=3)
-        path = args.output / f"C_{mode}_windows.jsonl"
-        write_windows(path, windows, "C_" + mode)
+        if mode == "frozen20":
+            control = _build_windows(segments, limit=500, global_gap_minutes=3)
+            if [(_utc(w["start"]), _utc(w["end"])) for w in control] != intervals(reference):
+                raise RuntimeError("C reference interval reproduction failed; stop before generating new submissions")
+            summary["reference"]["exact_reproduction"] = True
+        windows = _build_windows(segments, limit=500, global_gap_minutes=args.global_gap_minutes)
+        label = "C_" + mode + (f"_gap{args.global_gap_minutes}" if args.global_gap_minutes != 3 else "")
+        path = args.output / f"{label}_windows.jsonl"
+        write_windows(path, windows, label)
         lengths = [(w["end"] - w["start"]).total_seconds() / 60 for w in windows]
         current = set(intervals(path))
         summary["variants"][mode] = {**stats(segments), **diagnostics, "windows": len(windows),
@@ -63,16 +72,12 @@ def main():
             "exact_intervals_shared_with_C": len(reference_intervals & current),
             "new_or_changed_intervals": len(current - reference_intervals),
             "reference_intervals_not_preserved": len(reference_intervals - current)}
-        if mode == "frozen20":
-            if intervals(path) != intervals(reference):
-                raise RuntimeError("C reference interval reproduction failed; stop before generating new submissions")
-            summary["reference"]["exact_reproduction"] = True
-        elif args.prepare_submissions:
-            rule = path.with_name(f"C_{mode}_rule.jsonl")
-            submit = path.with_name(f"C_{mode}_submit.jsonl")
+        if args.prepare_submissions and (mode != "frozen20" or args.global_gap_minutes != 3):
+            rule = path.with_name(f"{label}_rule.jsonl")
+            submit = path.with_name(f"{label}_submit.jsonl")
             subprocess.run([sys.executable, str(repo / "ad_detection/scripts/make_v4_rule_submission.py"),
                             "--repo", str(repo), "--v4-windows", str(path), "--output", str(rule),
-                            "--prediction-prefix", "C_" + mode], check=True)
+                            "--prediction-prefix", label], check=True)
             subprocess.run([sys.executable, str(repo / "ad_detection/scripts/convert_submission_category_names.py"),
                             str(rule), str(submit)], check=True)
             subprocess.run([sys.executable, str(repo / "ad_detection/scripts/validate_submission.py"), str(submit)], check=True)
