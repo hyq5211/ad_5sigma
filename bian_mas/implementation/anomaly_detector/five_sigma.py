@@ -245,7 +245,17 @@ def _detect_metric_segments(
     *,
     zero_floors: dict[str, float] | None = None,
     diagnostics: dict[str, Any] | None = None,
+    baseline_mode: str = "frozen20",
+    block_start: datetime | None = None,
+    block_end: datetime | None = None,
+    block_count: int = 292,
 ) -> list[dict[str, Any]]:
+    if baseline_mode not in {"frozen20", "rolling69", "block292"}:
+        raise ValueError(f"Unknown baseline mode: {baseline_mode}")
+    if baseline_mode == "block292" and (
+        block_start is None or block_end is None or block_end <= block_start or block_count <= 0
+    ):
+        raise ValueError("Block baseline requires a positive time range and block count")
     segments: list[dict[str, Any]] = []
 
     def keep_segment(buffer: list[dict[str, Any]]) -> None:
@@ -283,6 +293,52 @@ def _detect_metric_segments(
 
         values.sort(key=lambda item: item[0])
         if len(values) < MIN_BASELINE_POINTS + 1:
+            continue
+
+        if baseline_mode != "frozen20":
+            candidate_points: list[dict[str, Any]] = []
+
+            def evaluate_point(timestamp: datetime, value: float, mean: float, std: float) -> None:
+                if not anomalous(value, mean, std):
+                    return
+                if candidate_points and timestamp - candidate_points[-1]["time"] > event_gap:
+                    keep_segment(candidate_points)
+                    candidate_points.clear()
+                candidate_points.append({"time": timestamp, "node": node, "metric": metric,
+                                         "magnitude": magnitude(value, mean, std)})
+
+            if baseline_mode == "rolling69":
+                history: deque[tuple[datetime, float]] = deque()
+                for timestamp, value in values:
+                    cutoff = timestamp - timedelta(minutes=69)
+                    while history and history[0][0] < cutoff:
+                        history.popleft()
+                    if len(history) >= MIN_BASELINE_POINTS:
+                        mean, std = _mean_std([v for _, v in history])
+                        evaluate_point(timestamp, value, mean, std)
+                    # Include prior anomalies in future baselines, never the current sample.
+                    history.append((timestamp, value))
+            else:
+                blocks: dict[int, list[tuple[datetime, float]]] = defaultdict(list)
+                span_us = (block_end - block_start) // timedelta(microseconds=1)
+                for timestamp, value in values:
+                    if not block_start <= timestamp < block_end:
+                        if diagnostics is not None:
+                            diagnostics["outside_block_range"] = diagnostics.get("outside_block_range", 0) + 1
+                        continue
+                    offset_us = (timestamp - block_start) // timedelta(microseconds=1)
+                    blocks[offset_us * block_count // span_us].append((timestamp, value))
+                for block in sorted(blocks):
+                    samples = blocks[block]
+                    if len(samples) < MIN_BASELINE_POINTS:
+                        if diagnostics is not None:
+                            diagnostics["insufficient_baseline_blocks"] = diagnostics.get("insufficient_baseline_blocks", 0) + 1
+                        continue
+                    mean, std = _mean_std([v for _, v in samples])
+                    for timestamp, value in samples:
+                        evaluate_point(timestamp, value, mean, std)
+                # Deliberately do not split events at arbitrary block boundaries.
+            keep_segment(candidate_points)
             continue
 
         baseline_window: deque[tuple[datetime, float]] = deque()

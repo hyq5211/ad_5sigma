@@ -42,6 +42,24 @@ Public configuration dependencies are included. The optional
 format helpers, which are not part of this AD-only snapshot.
 Generated candidate files and raw competition data are not published.
 
+## Traffic baseline controls
+
+The C traffic reference (AD 9.535391740361836) is reproduced exactly before
+comparing a rolling 69-minute historical baseline and a 14-day/292-block
+whole-block baseline. Sigma, metric/global gaps and aggregation remain fixed.
+Whole-block statistics use future samples and are an offline experiment.
+Blocks do not force an event or prevent cross-boundary aggregation.
+New variants have not been submitted.
+
+```powershell
+python tools/compare_traffic_baselines.py --data-root /path/to/phaseone_data
+python tools/test_traffic_baselines.py
+```
+
+This comparison expects the original C window file under
+`outputs/continuous_stage1/C_zero_variance_traffic_windows.jsonl` from stage 1.
+See `continuous_stage1_report.md` for local counts and interpretation.
+
 ## Reproduce the current AD window file locally
 
 ```powershell
