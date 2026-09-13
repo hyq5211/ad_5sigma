@@ -242,6 +242,9 @@ def _detect_metric_segments(
     series: dict[tuple[str, str], list[tuple[datetime, float]]],
     sigma: float,
     event_gap: timedelta,
+    *,
+    zero_floors: dict[str, float] | None = None,
+    diagnostics: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     segments: list[dict[str, Any]] = []
 
@@ -251,6 +254,8 @@ def _detect_metric_segments(
         start = buffer[0]["time"]
         end = buffer[-1]["time"]
         if end - start > MAX_METRIC_EVENT_DURATION:
+            if diagnostics is not None:
+                diagnostics["discarded_long_segments"] = diagnostics.get("discarded_long_segments", 0) + 1
             return
         top_point = max(buffer, key=lambda item: item["magnitude"])
         source = top_point["metric"].split(".", 1)[0]
@@ -265,6 +270,17 @@ def _detect_metric_segments(
         })
 
     for (node, metric), values in series.items():
+        floor = (zero_floors or {}).get(metric, 0.0)
+
+        def anomalous(value: float, mean: float, std: float) -> bool:
+            if std <= 1e-12 and floor > 0:
+                return abs(value - mean) > floor
+            return _is_anomaly(value, mean, std, sigma)
+
+        def magnitude(value: float, mean: float, std: float) -> float:
+            scale = floor / sigma if std <= 1e-12 and floor > 0 else std
+            return abs(value - mean) / max(scale, 1e-12)
+
         values.sort(key=lambda item: item[0])
         if len(values) < MIN_BASELINE_POINTS + 1:
             continue
@@ -285,17 +301,17 @@ def _detect_metric_segments(
 
                 baseline_values = [item[1] for item in baseline_window]
                 mean, std = _mean_std(baseline_values)
-                if _is_anomaly(value, mean, std, sigma):
+                if anomalous(value, mean, std):
                     frozen_baseline = (mean, std)
                     last_anomaly_time = timestamp
-                    current_segment = [{"time": timestamp, "node": node, "metric": metric, "magnitude": abs(value - mean) / max(std, 1e-12)}]
+                    current_segment = [{"time": timestamp, "node": node, "metric": metric, "magnitude": magnitude(value, mean, std)}]
                 else:
                     baseline_window.append((timestamp, value))
                 continue
 
             mean, std = frozen_baseline
-            if _is_anomaly(value, mean, std, sigma):
-                point = {"time": timestamp, "node": node, "metric": metric, "magnitude": abs(value - mean) / max(std, 1e-12)}
+            if anomalous(value, mean, std):
+                point = {"time": timestamp, "node": node, "metric": metric, "magnitude": magnitude(value, mean, std)}
                 if last_anomaly_time is None or timestamp - last_anomaly_time <= event_gap:
                     current_segment.append(point)
                 else:

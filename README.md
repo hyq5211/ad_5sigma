@@ -17,6 +17,30 @@ The generated JSONL outputs are intentionally not included in this public snapsh
 - `bian_mas/implementation/anomaly_detector/five_sigma.py`: frozen baseline 5sigma implementation.
 - `tools/run_frozen20_multisource_ad.py`: generate frozen-baseline AD windows with tunable gaps.
 - `tools/compare_frozen20_fusion_strategies.py`: compare traffic-anchor and per-source fusion strategies.
+- `tools/compare_continuous_stage1.py`: controlled continuous-metric preprocessing experiments.
+- `tools/test_continuous_stage1.py`: counter, zero-variance, and compatibility checks.
+
+## Stage 1 continuous-metric experiments
+
+These versions have not been submitted. They hold the baseline at 20 minutes,
+metric gap at 5 minutes, global gap at 3 minutes, traffic sigma at 5 and node
+sigma at 6. A preserves the original detector; B converts cumulative counters
+to per-second rates; C adds explicit effect thresholds for zero-variance
+baselines; D separates traffic series identities and removes duplicate samples.
+Missing samples and counter resets are not interpreted as zero-valued traffic.
+Additional node sigma 7/8 and node weight 0.3 variants test sensitivity separately.
+
+Run the full dataset comparison without submitting:
+
+```powershell
+python tools/compare_continuous_stage1.py --data-root /path/to/phaseone_data
+python tools/test_continuous_stage1.py
+```
+
+Public configuration dependencies are included. The optional
+`--prepare-submissions` switch requires the original workspace's submission
+format helpers, which are not part of this AD-only snapshot.
+Generated candidate files and raw competition data are not published.
 
 ## Reproduce the current AD window file locally
 

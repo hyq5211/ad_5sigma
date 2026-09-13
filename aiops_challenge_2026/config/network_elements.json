@@ -1,0 +1,24 @@
+{
+  "cities": [
+    "beida",
+    "shenyang",
+    "xian",
+    "chengdu",
+    "wuhan",
+    "shanghai",
+    "nanjing",
+    "guangzhou"
+  ],
+  "device_roles": [
+    "br-1",
+    "br-2",
+    "cr-1",
+    "cr-2",
+    "fw",
+    "traffic-vm",
+    "service-vm-1",
+    "service-vm-2",
+    "service-vm-3"
+  ],
+  "public_id_format": "<city>-<original-role>"
+}

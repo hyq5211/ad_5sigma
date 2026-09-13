@@ -1,0 +1,33 @@
+{
+  "topology_kind": "reference_only",
+  "reference_topology_relations": [
+    ["br-1", "cr-1", "routing_path"],
+    ["br-2", "cr-2", "routing_path"],
+    ["cr-1", "fw", "transit"],
+    ["cr-2", "fw", "transit"],
+    ["fw", "traffic-vm", "access"],
+    ["fw", "service-vm-1", "access"],
+    ["fw", "service-vm-2", "access"],
+    ["fw", "service-vm-3", "access"]
+  ],
+  "preprocessing": {
+    "max_evidence_per_candidate": 6,
+    "max_timeline_events": 64
+  },
+  "evidence": {
+    "per_modality_limit": 1024,
+    "per_node_limit": 12,
+    "candidate_limit": 72,
+    "agent_evidence_per_candidate": 2,
+    "agent_candidate_limit": 16
+  },
+  "model": {
+    "max_input_tokens": 24576,
+    "agent_max_new_tokens": 4096,
+    "judge_max_new_tokens": 6144,
+    "review_max_new_tokens": 2048,
+    "classification_max_new_tokens": 3072,
+    "retries": 1,
+    "seed": 42
+  }
+}
