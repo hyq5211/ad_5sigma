@@ -382,7 +382,12 @@ def _detect_metric_segments(
     trusted_cache_points: int = 20,
     trusted_max_age: timedelta = timedelta(minutes=60),
     trusted_recovery_samples: int = 3,
+    release_policy: str = "legacy",
 ) -> list[dict[str, Any]]:
+    if release_policy not in {"legacy", "before_current"}:
+        raise ValueError(f"Unknown release policy: {release_policy}")
+    if release_policy != "legacy" and baseline_mode != "frozen20":
+        raise ValueError("Release comparison requires frozen20 mode")
     if scale_floor_mode not in {"zero_only", "all_scales"}:
         raise ValueError(f"Unknown floor mode: {scale_floor_mode}")
     if mad_zero_fallback not in {"none", "std"}:
@@ -503,13 +508,65 @@ def _detect_metric_segments(
         frozen_baseline: tuple[float, float] | None = None
         last_anomaly_time: datetime | None = None
         current_segment: list[dict[str, Any]] = []
+        raw_history = deque()
+        previous = None
+        awaiting_refreeze = False
+
+        def audit_history(prefix, timestamp, chosen=None):
+            if diagnostics is None:
+                return
+            def count(key, amount=1):
+                key = prefix + "_" + key
+                diagnostics[key] = diagnostics.get(key, 0) + amount
+            # One slot per prior minute; duplicate samples cannot fill missing minutes.
+            slots = {}
+            selected_times = {t for t, _ in chosen} if chosen is not None else None
+            for time, _, status in raw_history:
+                if selected_times is not None and time not in selected_times:
+                    continue
+                age = (timestamp-time).total_seconds()
+                if 0 < age <= 1200:
+                    slot = int((age-1e-9)//60)
+                    slots.setdefault(slot, []).append(status)
+            normal = sum(all(s is False for s in states) for states in slots.values())
+            alerts = sum(any(s is True for s in states) for states in slots.values())
+            unknown = sum(not any(s is True for s in states) and any(s is None for s in states)
+                          for states in slots.values())
+            count("count")
+            count("normal_minutes_sum", normal)
+            count("missing_minutes_sum", 20-len(slots))
+            count("alert_minutes_sum", alerts)
+            count("unclassified_minutes_sum", unknown)
+            count("normal_lt20", int(normal < 20))
+            count("contains_alerts", int(alerts > 0))
+            count("missing_history", int(len(slots) < 20))
+            count("normal_" + ("0" if normal == 0 else "1_5" if normal <= 5
+                              else "6_11" if normal <= 11 else "12_19" if normal < 20 else "20"))
 
         for timestamp, value in values:
+            released = False
+            if diagnostics is not None or release_policy != "legacy":
+                if previous is not None:
+                    raw_history.append(previous)
+                previous = (timestamp, value, None)
+                while raw_history and raw_history[0][0] < timestamp-BASELINE_WINDOW:
+                    raw_history.popleft()
+            if (release_policy == "before_current" and frozen_baseline is not None
+                and last_anomaly_time is not None and timestamp-last_anomaly_time > event_gap):
+                audit_history("release", timestamp)
+                keep_segment(current_segment)
+                current_segment = []
+                frozen_baseline = None
+                last_anomaly_time = None
+                baseline_window = deque((t, v) for t, v, _ in raw_history)
+                released = awaiting_refreeze = True
             if frozen_baseline is None:
                 window_start = timestamp - BASELINE_WINDOW
                 while baseline_window and baseline_window[0][0] < window_start:
                     baseline_window.popleft()
                 if len(baseline_window) < MIN_BASELINE_POINTS:
+                    if released and diagnostics is not None:
+                        diagnostics["release_insufficient_points"] = diagnostics.get("release_insufficient_points", 0)+1
                     baseline_window.append((timestamp, value))
                     continue
 
@@ -531,7 +588,15 @@ def _detect_metric_segments(
                         diagnostics["zero_scale_baselines"] = diagnostics.get("zero_scale_baselines", 0) + 1
                     elif floor > 0 and sigma * std < floor:
                         diagnostics["small_scale_below_floor_baselines"] = diagnostics.get("small_scale_below_floor_baselines", 0) + 1
-                if anomalous(value, mean, std):
+                is_anomaly = anomalous(value, mean, std)
+                previous = (timestamp, value, is_anomaly)
+                if released and diagnostics is not None:
+                    diagnostics["release_immediate_evaluations"] = diagnostics.get("release_immediate_evaluations", 0)+1
+                if is_anomaly:
+                    audit_history("freeze_baseline", timestamp, baseline_window)
+                    if awaiting_refreeze:
+                        audit_history("refreeze", timestamp)
+                        awaiting_refreeze = False
                     frozen_baseline = (mean, std)
                     last_anomaly_time = timestamp
                     current_segment = [{"time": timestamp, "node": node, "metric": metric, "magnitude": magnitude(value, mean, std)}]
@@ -540,7 +605,9 @@ def _detect_metric_segments(
                 continue
 
             mean, std = frozen_baseline
-            if anomalous(value, mean, std):
+            is_anomaly = anomalous(value, mean, std)
+            previous = (timestamp, value, is_anomaly)
+            if is_anomaly:
                 point = {"time": timestamp, "node": node, "metric": metric, "magnitude": magnitude(value, mean, std)}
                 if last_anomaly_time is None or timestamp - last_anomaly_time <= event_gap:
                     current_segment.append(point)
@@ -551,11 +618,13 @@ def _detect_metric_segments(
                 continue
 
             if last_anomaly_time is not None and timestamp - last_anomaly_time > event_gap:
+                audit_history("release", timestamp)
                 keep_segment(current_segment)
                 current_segment = []
                 frozen_baseline = None
                 last_anomaly_time = None
                 baseline_window.clear()
+                awaiting_refreeze = True
             baseline_window.append((timestamp, value))
         keep_segment(current_segment)
 
