@@ -17,6 +17,20 @@ from compare_traffic_boundaries import extend_windows, prepare_submission
 from run_frozen20_multisource_ad import _build_windows, _utc, five_sigma as fs, load_config
 
 
+GUARD_ADDITIONS = {"observed_qps": .05, "disk_read_rate": 65536.0, "disk_write_rate": 65536.0}
+
+
+def configured_floors(series, guarded):
+    floors = floors_for(series)
+    if guarded:
+        for _, metric in series:
+            field = metric.split(".")[-1]
+            for suffix, value in GUARD_ADDITIONS.items():
+                if field.endswith(suffix):
+                    floors[metric] = value
+    return floors
+
+
 def write_records(path, records):
     with path.open("w", encoding="utf-8") as handle:
         for record in records:
@@ -51,12 +65,20 @@ def main():
     parser.add_argument("--data-root", type=Path, required=True)
     parser.add_argument("--output", type=Path, default=Path("outputs/frozen20_estimator_compare"))
     parser.add_argument("--prepare-submissions", action="store_true")
+    parser.add_argument("--guarded", action="store_true")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     repo = Path(__file__).resolve().parents[1]
     read = lambda path: [json.loads(l) for l in path.read_text(encoding="utf-8").splitlines() if l.strip()]
     reference = read(repo/"outputs/node_memory_compare/best338_memory_balanced_memory_windows.jsonl")
     traffic_reference = read(repo/"outputs/traffic_boundary_compare/C_boundary_sigma2_5_windows.jsonl")
+    configs = {"mean_std": {"baseline_estimator": "mean_std"}}
+    if args.guarded:
+        configs.update({"mean_std_guard": {"baseline_estimator": "mean_std", "scale_floor_mode": "all_scales"},
+                        "mad_guard": {"baseline_estimator": "mad", "scale_floor_mode": "all_scales"},
+                        "mad_guard_fallback": {"baseline_estimator": "mad", "scale_floor_mode": "all_scales", "mad_zero_fallback": "std"}})
+    else:
+        configs["mad"] = {"baseline_estimator": "mad"}
     summary = {"reference_AD": 14.55902988063768, "submitted": False,
         "fixed": {"baseline_minutes": 20, "metric_gap_minutes": 5, "global_gap_minutes": 3,
                   "traffic_sigma": 5, "node_sigma": 8, "traffic_boundary_sigma": 2.5,
@@ -64,6 +86,10 @@ def main():
                   "floors": "same existing zero-scale fallback; no new positive-scale clamp",
                   "node_selection": "same staged CPU/IO, disk-space, memory selection"},
         "traffic": {}, "node": {}, "variants": {}}
+    summary["configs"] = configs
+    if args.guarded:
+        summary["fixed"]["floors"] = "guarded profiles: max(k*scale, field floor), including weak edges"
+        summary["guard_additions"] = GUARD_ADDITIONS
     print("Reading full traffic", flush=True)
     original = fs._read_series(args.data_root, load_config()["region_aliases"], sources={"traffic"})
     for values in original.values():
@@ -72,17 +98,18 @@ def main():
     series, audit = counter_rates(original)
     del original
     summary["counter_audit"] = audit
-    floors = floors_for(series)
     traffic_records = {}
-    for estimator in ("mean_std", "mad"):
+    for estimator, config in configs.items():
+        floors = configured_floors(series, estimator != "mean_std" and args.guarded)
         print(f"Traffic estimator={estimator}", flush=True)
         diagnostic, aggregation = {}, {}
         segments = fs._detect_metric_segments(series, 5, timedelta(minutes=5), zero_floors=floors,
-            diagnostics=diagnostic, include_baseline=True, baseline_estimator=estimator)
+            diagnostics=diagnostic, include_baseline=True, **config)
         cores = _build_windows(segments, limit=500, global_gap_minutes=3, diagnostics=aggregation)
         if estimator == "mean_std" and [(_utc(w["start"]), _utc(w["end"])) for w in cores] != intervals(repo/"outputs/continuous_stage1/C_zero_variance_traffic_windows.jsonl"):
             raise RuntimeError("Mean/std traffic core reproduction failed")
-        windows, edge_audit = extend_windows(cores, series, floors, 2.5, start, start+timedelta(days=14))
+        windows, edge_audit = extend_windows(cores, series, floors, 2.5, start, start+timedelta(days=14),
+                                            floor_mode=config.get("scale_floor_mode", "zero_only"))
         path = args.output/f"traffic_{estimator}_windows.jsonl"
         write_windows(path, windows, "traffic_"+estimator)
         traffic_records[estimator] = read(path)
@@ -105,11 +132,11 @@ def main():
     for i, (node, data) in enumerate(sorted(nodes.items()), 1):
         current = {(node, "node."+field): [(t,v) for t,v in zip(data["times"], values) if math.isfinite(v)]
                    for field, values in data["fields"].items()}
-        current_floors = floors_for(current)
-        for estimator in traffic_records:
+        for estimator, config in configs.items():
+            current_floors = configured_floors(current, estimator != "mean_std" and args.guarded)
             diagnostic = {}
             segments = fs._detect_metric_segments(current, 8, timedelta(minutes=5), zero_floors=current_floors,
-                include_baseline=True, diagnostics=diagnostic, baseline_estimator=estimator)
+                include_baseline=True, diagnostics=diagnostic, **config)
             old, _ = node_candidates(node, data, 8, metric_segments=segments)
             relative, _ = node_candidates(node, data, 8, metric_segments=segments,
                 classifier=lambda values, flags: relative_classify(values, flags, PROFILES["balanced"]))
@@ -125,7 +152,15 @@ def main():
     for estimator in traffic_records:
         summary["node"][estimator] = {**diagnostics[estimator], "by_metric": dict(metric_counts[estimator]),
             "pressure_candidates": len(old_proposals[estimator])+len(relative_proposals[estimator])}
-    for traffic_estimator, node_estimator in (("mean_std", "mean_std"), ("mad", "mean_std"), ("mean_std", "mad"), ("mad", "mad")):
+    combinations = [("mean_std", "mean_std")]
+    if args.guarded:
+        combinations += [("mean_std", "mean_std_guard"), ("mean_std_guard", "mean_std"),
+                         ("mean_std_guard", "mean_std_guard")]
+        for estimator in ("mad_guard", "mad_guard_fallback"):
+            combinations += [(estimator, "mean_std_guard"), ("mean_std_guard", estimator), (estimator, estimator)]
+    else:
+        combinations += [("mad", "mean_std"), ("mean_std", "mad"), ("mad", "mad")]
+    for traffic_estimator, node_estimator in combinations:
         label = f"traffic_{traffic_estimator}_node_{node_estimator}"
         records, fusion_audit = fuse(traffic_records[traffic_estimator], old_proposals[node_estimator],
                                     relative_proposals[node_estimator], label)

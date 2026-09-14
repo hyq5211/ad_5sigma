@@ -20,7 +20,7 @@ MAX_SAMPLE_GAP = timedelta(minutes=2)
 RECOVERY_SAMPLES = 2
 
 
-def trace_evidence(samples, times, anchor, baseline, floor, sigma, step, lower, upper):
+def trace_evidence(samples, times, anchor, baseline, floor, sigma, step, lower, upper, *, floor_mode="zero_only"):
     index = bisect_left(times, anchor)
     if index == len(times) or times[index] != anchor:
         raise ValueError("Strong anchor missing from original series")
@@ -36,7 +36,7 @@ def trace_evidence(samples, times, anchor, baseline, floor, sigma, step, lower, 
             break
         previous = time
         delta = value - mean
-        threshold = floor if std <= 1e-12 else sigma * std
+        threshold = fs._anomaly_threshold(std, sigma, floor, floor_mode)
         weak = threshold > 0 and delta * direction > threshold
         if weak:
             recovered = 0
@@ -66,7 +66,7 @@ def cap_to_evidence(start, end, left, right):
     return selected_start, selected_end, True
 
 
-def extend_windows(windows, series, floors, sigma, dataset_start, dataset_end):
+def extend_windows(windows, series, floors, sigma, dataset_start, dataset_end, *, floor_mode="zero_only"):
     times = {key: [t for t, _ in samples] for key, samples in series.items()}
     output = []
     counters = {"duration_cap_limited": 0, "no_internal_strong_evidence": 0}
@@ -88,10 +88,10 @@ def extend_windows(windows, series, floors, sigma, dataset_start, dataset_end):
             internal += 1
             key = segment["node"], segment["metric"]
             left.extend(trace_evidence(series[key], times[key], min(strong), segment["baseline"],
-                        floors.get(key[1], 0), sigma, -1, lower, upper))
+                        floors.get(key[1], 0), sigma, -1, lower, upper, floor_mode=floor_mode))
             # An evidence sample occupies its original one-minute interval.
             right.extend(trace_evidence(series[key], times[key], max(strong), segment["baseline"],
-                         floors.get(key[1], 0), sigma, 1, lower, upper-MINUTE))
+                         floors.get(key[1], 0), sigma, 1, lower, upper-MINUTE, floor_mode=floor_mode))
         if not internal:
             counters["no_internal_strong_evidence"] += 1
         start, end, limited = cap_to_evidence(window["start"], window["end"], left, right)

@@ -156,6 +156,14 @@ def _is_anomaly(value: float, mean: float, std: float, sigma: float) -> bool:
     return std > 1e-12 and abs(value - mean) > sigma * std
 
 
+def _anomaly_threshold(std: float, sigma: float, floor: float, mode: str) -> float:
+    if mode == "all_scales":
+        return max(sigma * std if std > 1e-12 else 0.0, floor)
+    if mode == "zero_only":
+        return floor if std <= 1e-12 else sigma * std
+    raise ValueError(f"Unknown floor mode: {mode}")
+
+
 def _read_series(
     root: Path,
     aliases: dict[str, str],
@@ -261,7 +269,15 @@ def _detect_metric_segments(
     block_count: int = 292,
     include_baseline: bool = False,
     baseline_estimator: str = "mean_std",
+    scale_floor_mode: str = "zero_only",
+    mad_zero_fallback: str = "none",
 ) -> list[dict[str, Any]]:
+    if scale_floor_mode not in {"zero_only", "all_scales"}:
+        raise ValueError(f"Unknown floor mode: {scale_floor_mode}")
+    if mad_zero_fallback not in {"none", "std"}:
+        raise ValueError(f"Unknown MAD fallback: {mad_zero_fallback}")
+    if mad_zero_fallback != "none" and baseline_estimator != "mad":
+        raise ValueError("MAD fallback requires MAD estimator")
     if baseline_estimator not in {"mean_std", "mad"}:
         raise ValueError(f"Unknown baseline estimator: {baseline_estimator}")
     if baseline_estimator != "mean_std" and baseline_mode != "frozen20":
@@ -303,12 +319,13 @@ def _detect_metric_segments(
         floor = (zero_floors or {}).get(metric, 0.0)
 
         def anomalous(value: float, mean: float, std: float) -> bool:
-            if std <= 1e-12 and floor > 0:
-                return abs(value - mean) > floor
-            return _is_anomaly(value, mean, std, sigma)
+            threshold = _anomaly_threshold(std, sigma, floor, scale_floor_mode)
+            return threshold > 0 and abs(value - mean) > threshold
 
         def magnitude(value: float, mean: float, std: float) -> float:
             scale = floor / sigma if std <= 1e-12 and floor > 0 else std
+            if scale_floor_mode == "all_scales":
+                scale = max(scale, floor / sigma)
             return abs(value - mean) / max(scale, 1e-12)
 
         values.sort(key=lambda item: item[0])
@@ -377,12 +394,20 @@ def _detect_metric_segments(
 
                 baseline_values = [item[1] for item in baseline_window]
                 mean, std = _baseline_center_scale(baseline_values, baseline_estimator)
+                if baseline_estimator == "mad" and std <= 1e-12:
+                    ordinary_scale = _mean_std(baseline_values)[1]
+                    if diagnostics is not None:
+                        diagnostics["raw_mad_zero_baselines"] = diagnostics.get("raw_mad_zero_baselines", 0) + 1
+                        if ordinary_scale > 1e-12:
+                            diagnostics["mad_zero_with_nonzero_std_baselines"] = diagnostics.get("mad_zero_with_nonzero_std_baselines", 0) + 1
+                    if mad_zero_fallback == "std" and ordinary_scale > 1e-12:
+                        std = ordinary_scale
+                        if diagnostics is not None:
+                            diagnostics["mad_std_fallback_uses"] = diagnostics.get("mad_std_fallback_uses", 0) + 1
                 if diagnostics is not None:
                     diagnostics["baseline_evaluations"] = diagnostics.get("baseline_evaluations", 0) + 1
                     if std <= 1e-12:
                         diagnostics["zero_scale_baselines"] = diagnostics.get("zero_scale_baselines", 0) + 1
-                        if baseline_estimator == "mad" and _mean_std(baseline_values)[1] > 1e-12:
-                            diagnostics["mad_zero_with_nonzero_std_baselines"] = diagnostics.get("mad_zero_with_nonzero_std_baselines", 0) + 1
                     elif floor > 0 and sigma * std < floor:
                         diagnostics["small_scale_below_floor_baselines"] = diagnostics.get("small_scale_below_floor_baselines", 0) + 1
                 if anomalous(value, mean, std):
