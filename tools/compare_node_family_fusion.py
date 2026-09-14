@@ -112,13 +112,15 @@ def classify(values, flags):
     return families
 
 
-def node_candidates(node, samples, sigma, classifier=classify):
+def node_candidates(node, samples, sigma, classifier=classify, metric_segments=None):
     times = samples["times"]
     lookup = {t: i for i, t in enumerate(times)}
     series = {(node, "node."+field): [(t, v) for t, v in zip(times, samples["fields"][field]) if math.isfinite(v)] for field in FIELDS}
     diagnostic = {}
-    segments = fs._detect_metric_segments(series, sigma, timedelta(minutes=5), zero_floors=floors_for(series),
-                                         diagnostics=diagnostic, include_baseline=True)
+    segments = metric_segments
+    if segments is None:
+        segments = fs._detect_metric_segments(series, sigma, timedelta(minutes=5), zero_floors=floors_for(series),
+                                             diagnostics=diagnostic, include_baseline=True)
     flags = defaultdict(dict)
     for segment in segments:
         field = segment["metric"].split(".")[-1]
