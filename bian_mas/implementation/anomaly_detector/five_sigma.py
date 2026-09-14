@@ -4,6 +4,7 @@ from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 import csv
 import math
+from statistics import median
 from pathlib import Path
 from typing import Any
 
@@ -142,6 +143,15 @@ def _mean_std(values: list[float]) -> tuple[float, float]:
     return mean, math.sqrt(variance)
 
 
+def _baseline_center_scale(values: list[float], estimator: str) -> tuple[float, float]:
+    if estimator == "mean_std":
+        return _mean_std(values)
+    if estimator == "mad":
+        center = median(values)
+        return center, 1.4826 * median([abs(value-center) for value in values])
+    raise ValueError(f"Unknown baseline estimator: {estimator}")
+
+
 def _is_anomaly(value: float, mean: float, std: float, sigma: float) -> bool:
     return std > 1e-12 and abs(value - mean) > sigma * std
 
@@ -250,7 +260,12 @@ def _detect_metric_segments(
     block_end: datetime | None = None,
     block_count: int = 292,
     include_baseline: bool = False,
+    baseline_estimator: str = "mean_std",
 ) -> list[dict[str, Any]]:
+    if baseline_estimator not in {"mean_std", "mad"}:
+        raise ValueError(f"Unknown baseline estimator: {baseline_estimator}")
+    if baseline_estimator != "mean_std" and baseline_mode != "frozen20":
+        raise ValueError("Robust estimator comparison requires frozen20 mode")
     if baseline_mode not in {"frozen20", "rolling69", "block292"}:
         raise ValueError(f"Unknown baseline mode: {baseline_mode}")
     if include_baseline and baseline_mode != "frozen20":
@@ -361,7 +376,15 @@ def _detect_metric_segments(
                     continue
 
                 baseline_values = [item[1] for item in baseline_window]
-                mean, std = _mean_std(baseline_values)
+                mean, std = _baseline_center_scale(baseline_values, baseline_estimator)
+                if diagnostics is not None:
+                    diagnostics["baseline_evaluations"] = diagnostics.get("baseline_evaluations", 0) + 1
+                    if std <= 1e-12:
+                        diagnostics["zero_scale_baselines"] = diagnostics.get("zero_scale_baselines", 0) + 1
+                        if baseline_estimator == "mad" and _mean_std(baseline_values)[1] > 1e-12:
+                            diagnostics["mad_zero_with_nonzero_std_baselines"] = diagnostics.get("mad_zero_with_nonzero_std_baselines", 0) + 1
+                    elif floor > 0 and sigma * std < floor:
+                        diagnostics["small_scale_below_floor_baselines"] = diagnostics.get("small_scale_below_floor_baselines", 0) + 1
                 if anomalous(value, mean, std):
                     frozen_baseline = (mean, std)
                     last_anomaly_time = timestamp
