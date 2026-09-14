@@ -256,6 +256,113 @@ def _detect_points(
     return points
 
 
+def _detect_trusted_metric(node, metric, values, sigma, event_gap, floor, floor_mode,
+                           include_baseline, diagnostics, delay, cache_points, max_age, recovery_samples):
+    history, cache, pending = deque(), deque(), deque()
+    frozen = None
+    frozen_since = last_anomaly = None
+    recovery_left = 0
+    buffer, output = [], []
+
+    def count(name, amount=1):
+        if diagnostics is not None:
+            diagnostics[name] = diagnostics.get(name, 0) + amount
+
+    def keep():
+        if not buffer:
+            return
+        if buffer[-1]["time"]-buffer[0]["time"] > MAX_METRIC_EVENT_DURATION:
+            count("discarded_long_segments")
+            return
+        strongest = max(buffer, key=lambda p: p["magnitude"])
+        segment = {"start": buffer[0]["time"], "end": buffer[-1]["time"]+timedelta(minutes=1),
+                   "node": node, "metric": metric, "source": metric.split(".", 1)[0],
+                   "points": list(buffer), "magnitude": strongest["magnitude"]}
+        if include_baseline:
+            segment["baseline"] = {"mean": frozen[0], "std": frozen[1]}
+        output.append(segment)
+
+    def point(timestamp, value, mean, std):
+        scale = floor/sigma if std <= 1e-12 and floor > 0 else std
+        if floor_mode == "all_scales":
+            scale = max(scale, floor/sigma)
+        return {"time": timestamp, "node": node, "metric": metric,
+                "magnitude": abs(value-mean)/max(scale, 1e-12)}
+
+    for timestamp, value in values:
+        while history and history[0][0] < timestamp-BASELINE_WINDOW:
+            history.popleft()
+        while cache and cache[0][0] < timestamp-max_age:
+            cache.popleft()
+            count("trusted_cache_expired_points")
+        # Pending samples are all earlier observations, never the current point.
+        while pending and timestamp-pending[0][0] >= delay:
+            sample = pending.popleft()
+            if sample[0] >= timestamp-max_age:
+                cache.append(sample)
+                count("trusted_admitted_points")
+                while len(cache) > cache_points:
+                    cache.popleft()
+        try:
+            if frozen is not None:
+                mean, std = frozen
+                count("trusted_frozen_points")
+                count("trusted_frozen_age_sum_seconds", (timestamp-frozen_since).total_seconds())
+                threshold = _anomaly_threshold(std, sigma, floor, floor_mode)
+                if threshold > 0 and abs(value-mean) > threshold:
+                    if timestamp-last_anomaly > event_gap:
+                        keep()
+                        buffer = []
+                    buffer.append(point(timestamp, value, mean, std))
+                    last_anomaly = timestamp
+                elif timestamp-last_anomaly > event_gap:
+                    keep()
+                    buffer = []
+                    frozen = None
+                    frozen_since = last_anomaly = None
+                    recovery_left = recovery_samples-1
+                    count("trusted_recovery_held_points")
+                continue
+
+            if len(cache) >= MIN_BASELINE_POINTS:
+                baseline_values = [v for _, v in cache]
+                count("trusted_cache_used")
+                age = (timestamp-cache[0][0]).total_seconds()
+                count("trusted_cache_age_sum_seconds", age)
+                if age > 30*60:
+                    count("trusted_cache_age_over30_used")
+            elif len(history) >= MIN_BASELINE_POINTS:
+                baseline_values = [v for _, v in history]
+                count("trusted_fallback_used")
+            else:
+                count("trusted_warmup_skipped_points")
+                continue
+            mean, std = _mean_std(baseline_values)
+            count("baseline_evaluations")
+            if std <= 1e-12:
+                count("zero_scale_baselines")
+            elif floor > 0 and sigma*std < floor:
+                count("small_scale_below_floor_baselines")
+            threshold = _anomaly_threshold(std, sigma, floor, floor_mode)
+            if threshold > 0 and abs(value-mean) > threshold:
+                frozen = mean, std
+                frozen_since = last_anomaly = timestamp
+                buffer = [point(timestamp, value, mean, std)]
+                count("trusted_quarantined_pending_points", len(pending))
+                pending.clear()
+                recovery_left = 0
+            elif recovery_left:
+                recovery_left -= 1
+                count("trusted_recovery_held_points")
+            else:
+                pending.append((timestamp, value))
+        finally:
+            history.append((timestamp, value))
+    keep()
+    count("trusted_pending_at_end", len(pending))
+    return output
+
+
 def _detect_metric_segments(
     series: dict[tuple[str, str], list[tuple[datetime, float]]],
     sigma: float,
@@ -271,6 +378,10 @@ def _detect_metric_segments(
     baseline_estimator: str = "mean_std",
     scale_floor_mode: str = "zero_only",
     mad_zero_fallback: str = "none",
+    trusted_delay: timedelta = timedelta(minutes=2),
+    trusted_cache_points: int = 20,
+    trusted_max_age: timedelta = timedelta(minutes=60),
+    trusted_recovery_samples: int = 3,
 ) -> list[dict[str, Any]]:
     if scale_floor_mode not in {"zero_only", "all_scales"}:
         raise ValueError(f"Unknown floor mode: {scale_floor_mode}")
@@ -282,10 +393,14 @@ def _detect_metric_segments(
         raise ValueError(f"Unknown baseline estimator: {baseline_estimator}")
     if baseline_estimator != "mean_std" and baseline_mode != "frozen20":
         raise ValueError("Robust estimator comparison requires frozen20 mode")
-    if baseline_mode not in {"frozen20", "rolling69", "block292"}:
+    if baseline_mode not in {"frozen20", "trusted20", "rolling69", "block292"}:
         raise ValueError(f"Unknown baseline mode: {baseline_mode}")
-    if include_baseline and baseline_mode != "frozen20":
-        raise ValueError("Baseline snapshots require frozen20 mode")
+    if include_baseline and baseline_mode not in {"frozen20", "trusted20"}:
+        raise ValueError("Baseline snapshots require a frozen baseline mode")
+    if baseline_mode == "trusted20" and (trusted_delay <= timedelta(0)
+        or trusted_cache_points < MIN_BASELINE_POINTS or trusted_max_age < trusted_delay
+        or trusted_recovery_samples < 1):
+        raise ValueError("Invalid trusted history configuration")
     if baseline_mode == "block292" and (
         block_start is None or block_end is None or block_end <= block_start or block_count <= 0
     ):
@@ -330,6 +445,12 @@ def _detect_metric_segments(
 
         values.sort(key=lambda item: item[0])
         if len(values) < MIN_BASELINE_POINTS + 1:
+            continue
+
+        if baseline_mode == "trusted20":
+            segments.extend(_detect_trusted_metric(node, metric, values, sigma, event_gap, floor,
+                scale_floor_mode, include_baseline, diagnostics, trusted_delay, trusted_cache_points,
+                trusted_max_age, trusted_recovery_samples))
             continue
 
         if baseline_mode != "frozen20":
