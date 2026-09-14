@@ -385,7 +385,10 @@ def _detect_metric_segments(
     release_policy: str = "legacy",
     release_history: str = "raw",
     supplement_max_age: timedelta = timedelta(minutes=60),
+    problem_segments: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
+    if problem_segments is not None and baseline_mode != "frozen20":
+        raise ValueError("Problem segment collection requires frozen20 mode")
     if release_policy not in {"legacy", "before_current"}:
         raise ValueError(f"Unknown release policy: {release_policy}")
     if release_policy != "legacy" and baseline_mode != "frozen20":
@@ -428,6 +431,13 @@ def _detect_metric_segments(
         if end - start > MAX_METRIC_EVENT_DURATION:
             if diagnostics is not None:
                 diagnostics["discarded_long_segments"] = diagnostics.get("discarded_long_segments", 0) + 1
+            if problem_segments is not None:
+                top_point = max(buffer, key=lambda item: item["magnitude"])
+                problem_segments.append({"start": start, "end": end+timedelta(minutes=1),
+                    "node": top_point["node"], "metric": top_point["metric"],
+                    "source": top_point["metric"].split(".", 1)[0], "points": list(buffer),
+                    "magnitude": top_point["magnitude"],
+                    "baseline": {"mean": frozen_baseline[0], "std": frozen_baseline[1]}})
             return
         top_point = max(buffer, key=lambda item: item["magnitude"])
         source = top_point["metric"].split(".", 1)[0]

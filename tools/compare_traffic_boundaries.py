@@ -87,11 +87,13 @@ def extend_windows(windows, series, floors, sigma, dataset_start, dataset_end, *
                 continue
             internal += 1
             key = segment["node"], segment["metric"]
+            segment_lower = max(lower, segment.get("review_lower", lower))
+            segment_upper = min(upper, segment.get("review_upper", upper))
             left.extend(trace_evidence(series[key], times[key], min(strong), segment["baseline"],
-                        floors.get(key[1], 0), sigma, -1, lower, upper, floor_mode=floor_mode))
+                        floors.get(key[1], 0), sigma, -1, segment_lower, segment_upper, floor_mode=floor_mode))
             # An evidence sample occupies its original one-minute interval.
             right.extend(trace_evidence(series[key], times[key], max(strong), segment["baseline"],
-                         floors.get(key[1], 0), sigma, 1, lower, upper-MINUTE, floor_mode=floor_mode))
+                         floors.get(key[1], 0), sigma, 1, segment_lower, segment_upper-MINUTE, floor_mode=floor_mode))
         if not internal:
             counters["no_internal_strong_evidence"] += 1
         start, end, limited = cap_to_evidence(window["start"], window["end"], left, right)
