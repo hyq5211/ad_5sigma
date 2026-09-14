@@ -383,11 +383,19 @@ def _detect_metric_segments(
     trusted_max_age: timedelta = timedelta(minutes=60),
     trusted_recovery_samples: int = 3,
     release_policy: str = "legacy",
+    release_history: str = "raw",
+    supplement_max_age: timedelta = timedelta(minutes=60),
 ) -> list[dict[str, Any]]:
     if release_policy not in {"legacy", "before_current"}:
         raise ValueError(f"Unknown release policy: {release_policy}")
     if release_policy != "legacy" and baseline_mode != "frozen20":
         raise ValueError("Release comparison requires frozen20 mode")
+    if release_history not in {"raw", "exclude_alerts", "normal_supplement"}:
+        raise ValueError(f"Unknown release history: {release_history}")
+    if release_history != "raw" and release_policy != "before_current":
+        raise ValueError("Filtered release history requires before_current release")
+    if release_history == "normal_supplement" and supplement_max_age < BASELINE_WINDOW:
+        raise ValueError("Supplement age must cover the baseline window")
     if scale_floor_mode not in {"zero_only", "all_scales"}:
         raise ValueError(f"Unknown floor mode: {scale_floor_mode}")
     if mad_zero_fallback not in {"none", "std"}:
@@ -511,6 +519,8 @@ def _detect_metric_segments(
         raw_history = deque()
         previous = None
         awaiting_refreeze = False
+        history_filter_active = False
+        prior_normal_baseline = []
 
         def audit_history(prefix, timestamp, chosen=None):
             if diagnostics is None:
@@ -559,15 +569,39 @@ def _detect_metric_segments(
                 frozen_baseline = None
                 last_anomaly_time = None
                 baseline_window = deque((t, v) for t, v, _ in raw_history)
+                history_filter_active = release_history != "raw"
                 released = awaiting_refreeze = True
             if frozen_baseline is None:
                 window_start = timestamp - BASELINE_WINDOW
                 while baseline_window and baseline_window[0][0] < window_start:
                     baseline_window.popleft()
+                if history_filter_active:
+                    # Unknown warmup samples bootstrap detection, but never enter the old-normal pool.
+                    alert_times = {t for t, _, status in raw_history if status is True}
+                    baseline_window = deque((t, v) for t, v, _ in raw_history
+                                            if t < timestamp and t not in alert_times)
+                    if diagnostics is not None:
+                        diagnostics["filtered_history_evaluations"] = diagnostics.get("filtered_history_evaluations", 0)+1
+                        diagnostics["excluded_alert_samples_sum"] = diagnostics.get("excluded_alert_samples_sum", 0)+sum(s is True for _, _, s in raw_history)
+                    if release_history == "normal_supplement":
+                        prior_normal_baseline = [(t, v) for t, v in prior_normal_baseline
+                                                 if timedelta(0) < timestamp-t <= supplement_max_age]
+                        occupied = {t.replace(second=0, microsecond=0) for t, _ in baseline_window}
+                        older = []
+                        for time, sample in reversed(prior_normal_baseline):
+                            minute = time.replace(second=0, microsecond=0)
+                            if len(occupied) >= 20:
+                                break
+                            if time < window_start and minute not in occupied:
+                                occupied.add(minute)
+                                older.append((time, sample))
+                        baseline_window = deque(sorted([*baseline_window, *older]))
                 if len(baseline_window) < MIN_BASELINE_POINTS:
                     if released and diagnostics is not None:
                         diagnostics["release_insufficient_points"] = diagnostics.get("release_insufficient_points", 0)+1
                     baseline_window.append((timestamp, value))
+                    if history_filter_active and diagnostics is not None:
+                        diagnostics["filtered_warmup_skipped_points"] = diagnostics.get("filtered_warmup_skipped_points", 0)+1
                     continue
 
                 baseline_values = [item[1] for item in baseline_window]
@@ -594,6 +628,26 @@ def _detect_metric_segments(
                     diagnostics["release_immediate_evaluations"] = diagnostics.get("release_immediate_evaluations", 0)+1
                 if is_anomaly:
                     audit_history("freeze_baseline", timestamp, baseline_window)
+                    if history_filter_active:
+                        occupied = {t.replace(second=0, microsecond=0) for t, _ in baseline_window}
+                        older_count = sum(t < window_start for t, _ in baseline_window)
+                        if diagnostics is not None:
+                            for key, amount in {
+                                "filtered_freezes": 1,
+                                "filtered_selected_minutes_sum": len(occupied),
+                                "filtered_selected_lt20": int(len(occupied) < 20),
+                                "supplemented_freezes": int(older_count > 0),
+                                "supplemented_samples_sum": older_count,
+                                "filtered_oldest_age_seconds_sum": (timestamp-baseline_window[0][0]).total_seconds(),
+                            }.items():
+                                diagnostics[key] = diagnostics.get(key, 0)+amount
+                    if release_history == "normal_supplement":
+                        normal_times = {t for t, _, status in raw_history if status is False}
+                        prior_times = {t for t, _ in prior_normal_baseline}
+                        alert_times = {t for t, _, status in raw_history if status is True}
+                        prior_normal_baseline = [(t, v) for t, v in baseline_window
+                            if t not in alert_times and (t in normal_times or t in prior_times)
+                            and not anomalous(v, mean, std)]
                     if awaiting_refreeze:
                         audit_history("refreeze", timestamp)
                         awaiting_refreeze = False

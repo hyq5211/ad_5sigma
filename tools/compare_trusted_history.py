@@ -45,11 +45,18 @@ def main():
     parser.add_argument("--data-root", type=Path, required=True)
     parser.add_argument("--output", type=Path, default=Path("outputs/trusted_history_compare"))
     parser.add_argument("--prepare-submissions", action="store_true")
-    parser.add_argument("--comparison", choices=("trusted", "release"), default="trusted")
+    parser.add_argument("--comparison", choices=("trusted", "release", "clean_release"), default="trusted")
     args = parser.parse_args()
     configs = CONFIGS if args.comparison == "trusted" else {
         "legacy": {"baseline_mode": "frozen20"},
         "release_before": {"baseline_mode": "frozen20", "release_policy": "before_current"}}
+    if args.comparison == "clean_release":
+        configs = {
+            "legacy": {"baseline_mode": "frozen20"},
+            "exclude_alerts": {"baseline_mode": "frozen20", "release_policy": "before_current",
+                               "release_history": "exclude_alerts"},
+            "normal_supplement": {"baseline_mode": "frozen20", "release_policy": "before_current",
+                                  "release_history": "normal_supplement"}}
     args.output.mkdir(parents=True, exist_ok=True)
     repo = Path(__file__).resolve().parents[1]
     read = lambda path: [json.loads(l) for l in path.read_text(encoding="utf-8").splitlines() if l.strip()]
@@ -63,12 +70,16 @@ def main():
                   "traffic_floor": "legacy zero-scale fallback", "node_floor": "current all-scale guards",
                   "fallback": "prior 20min raw history; never current/future", "traffic_weak_sigma": 2.5},
         "traffic": {}, "node": {}, "variants": {}}
-    if args.comparison == "release":
+    if args.comparison in {"release", "clean_release"}:
         for key in ("cache_points", "cache_max_age_minutes", "recovery_samples", "fallback"):
             summary["fixed"].pop(key)
         summary["fixed"]["new_release_history"] = "all observed prior 20min samples, including flags; no old-baseline supplementation"
         summary["fixed"]["release_rule"] = "elapsed since last anomaly >5min, before classifying current"
         summary["audit_scope"] = "release/refreeze audit recent raw history; freeze_baseline audits actual selected samples; counts include starts later discarded as long"
+    if args.comparison == "clean_release":
+        summary["fixed"]["new_release_history"] = "exclude previously flagged timestamps; unknown warmup samples remain eligible"
+        summary["supplement"] = "previous actual baseline, previously unflagged and checked under its baseline; max age60min; supplement distinct minutes to20; unknown samples never join old-normal pool"
+        summary["node_fixed"] = "current best legacy8sigma with all-scale floors"
     original = fs._read_series(args.data_root, load_config()["region_aliases"], sources={"traffic"})
     for samples in original.values():
         samples.sort(key=lambda p: p[0])
@@ -101,15 +112,16 @@ def main():
     gc.collect()
     nodes, rows = read_nodes(args.data_root, load_config()["region_aliases"])
     summary["node_rows"], summary["nodes"] = rows, len(nodes)
-    old = {name: [] for name in configs}
-    relative = {name: [] for name in configs}
-    diagnostics = {name: Counter() for name in configs}
-    metrics = {name: Counter() for name in configs}
+    node_configs = {"legacy": configs["legacy"]} if args.comparison == "clean_release" else configs
+    old = {name: [] for name in node_configs}
+    relative = {name: [] for name in node_configs}
+    diagnostics = {name: Counter() for name in node_configs}
+    metrics = {name: Counter() for name in node_configs}
     for i, (node, data) in enumerate(sorted(nodes.items()), 1):
         current = {(node, "node."+f): [(t,v) for t,v in zip(data["times"], values) if math.isfinite(v)]
                    for f, values in data["fields"].items()}
         current_floors = configured_floors(current, True)
-        for name, config in configs.items():
+        for name, config in node_configs.items():
             diagnostic = {}
             segments = fs._detect_metric_segments(current, 8, timedelta(minutes=5), zero_floors=current_floors,
                 scale_floor_mode="all_scales", include_baseline=True, diagnostics=diagnostic, **config)
@@ -124,8 +136,8 @@ def main():
                 "singleton_segments": sum(len(s["points"]) == 1 for s in segments)})
             metrics[name].update(s["metric"] for s in segments)
         if i % 8 == 0 or i == len(nodes):
-            print(f"Node {i}/{len(nodes)}: " + str({n: len(old[n])+len(relative[n]) for n in configs}), flush=True)
-    for name in configs:
+            print(f"Node {i}/{len(nodes)}: " + str({n: len(old[n])+len(relative[n]) for n in node_configs}), flush=True)
+    for name in node_configs:
         summary["node"][name] = {**diagnostics[name], **cache_statistics(diagnostics[name]),
             **release_statistics(diagnostics[name]),
             "by_metric": dict(metrics[name]), "pressure_candidates": len(old[name])+len(relative[name])}
@@ -133,7 +145,9 @@ def main():
     for name in configs:
         if name == "legacy":
             continue
-        combinations += [(name, "legacy"), ("legacy", name), (name, name)]
+        combinations += [(name, "legacy")]
+        if args.comparison != "clean_release":
+            combinations += [("legacy", name), (name, name)]
     for traffic_name, node_name in combinations:
         label = f"traffic_{traffic_name}_node_{node_name}"
         records, audit = fuse(traffic_records[traffic_name], old[node_name], relative[node_name], label)
