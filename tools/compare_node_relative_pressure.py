@@ -81,14 +81,21 @@ def main():
     parser.add_argument("--data-root", required=True, type=Path)
     parser.add_argument("--output", type=Path, default=Path("outputs/node_relative_compare"))
     parser.add_argument("--prepare-submissions", action="store_true")
+    parser.add_argument("--reference", type=Path,
+                        default=Path("outputs/node_family_compare/traffic25_node_family_sigma8_windows.jsonl"))
+    parser.add_argument("--reference-ad", type=float, default=None)
+    parser.add_argument("--families", nargs="+", choices=("memory", "disk_space", "process", "all"),
+                        default=["memory", "disk_space", "process", "all"])
+    parser.add_argument("--label-prefix", default="node_relative")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     repo = Path(__file__).resolve().parents[1]
-    reference_path = repo / "outputs/node_family_compare/traffic25_node_family_sigma8_windows.jsonl"
+    reference_path = args.reference if args.reference.is_absolute() else repo / args.reference
     reference = [json.loads(l) for l in reference_path.read_text(encoding="utf-8").splitlines() if l.strip()]
     fixed = [{"start": fs._time({"timestamp": r["start"]}), "end": fs._time({"timestamp": r["end"]})} for r in reference]
     nodes, rows = read_nodes(args.data_root, load_config()["region_aliases"])
-    summary = {"reference_AD": 13.500592373195124, "reference_windows": len(reference),
+    summary = {"reference_AD": args.reference_ad, "reference_path": str(reference_path),
+               "reference_windows": len(reference),
                "rows": rows, "nodes": len(nodes), "full_distribution": full_distribution(nodes),
                "profiles": PROFILES, "sigma": 8, "submitted": False, "variants": {}}
     print(summary["full_distribution"], flush=True)
@@ -104,10 +111,10 @@ def main():
             print(f"Processed {i}/{len(nodes)}: " + str({n: len(p) for n, p in proposals.items()}), flush=True)
     # Isolate each indicator family so an eventual submission has a single change.
     for name in PROFILES:
-        for family in ("memory", "disk_space", "process", "all"):
+        for family in args.families:
             candidates = [p for p in proposals[name] if family == "all" or family in p["families"]]
             selected, audit = select_additions(candidates, fixed)
-            label = f"node_relative_{name}_{family}"
+            label = f"{args.label_prefix}_{name}_{family}"
             records = build_records(reference, selected, label)
             path = args.output / (label + "_windows.jsonl")
             with path.open("w", encoding="utf-8") as handle:
@@ -119,10 +126,20 @@ def main():
                 "added_family_counts": dict(Counter(f for p in selected for f in p["families"])),
                 "mean_minutes": statistics.mean(lengths) if lengths else 0,
                 "short_windows": sum(v <= 3 for v in lengths), "fixed_intervals_preserved": True,
+                "added_intervals": [{"start": _utc(p["start"]), "end": _utc(p["end"]),
+                                     "nodes": sorted(p["nodes"])} for p in selected],
                 "detector_audit": dict(audits[name])}
             if selected and args.prepare_submissions:
                 prepare_submission(repo, path, label)
             print({"variant": label, **summary["variants"][label]}, flush=True)
+    if args.families == ["memory"]:
+        conservative = summary["variants"][f"{args.label_prefix}_conservative_memory"]["added_intervals"]
+        balanced = summary["variants"][f"{args.label_prefix}_balanced_memory"]["added_intervals"]
+        intervals = lambda rows: {(r["start"], r["end"]) for r in rows}
+        a, b = intervals(conservative), intervals(balanced)
+        summary["memory_comparison"] = {"same_added_intervals": len(a & b),
+                                        "conservative_only_intervals": len(a - b),
+                                        "balanced_only_intervals": len(b - a)}
     write_json(args.output / "summary.json", summary)
 
 

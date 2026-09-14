@@ -1,6 +1,8 @@
 import unittest
+from datetime import datetime, timedelta, timezone
 
 from compare_node_relative_pressure import PROFILES, relative_classify, build_records
+from compare_node_family_fusion import select_additions
 
 
 class RelativeTests(unittest.TestCase):
@@ -27,6 +29,15 @@ class RelativeTests(unittest.TestCase):
         self.assertEqual(build_records([record], [], "test"), [record])
         with self.assertRaises(RuntimeError):
             build_records([record, record], [], "test")
+
+    def test_new_disk_reference_blocks_nearby_memory_candidate(self):
+        start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        memory = {"start": start, "end": start+timedelta(minutes=10), "score": 20,
+                  "families": {"memory"}, "nodes": {"n"}, "points": []}
+        disk = {"start": start+timedelta(minutes=12), "end": start+timedelta(minutes=20)}
+        selected, audit = select_additions([memory], [disk])
+        self.assertEqual(selected, [])
+        self.assertEqual(audit["overlap_or_within_5min_of_traffic"], 1)
 
 
 if __name__ == "__main__":
